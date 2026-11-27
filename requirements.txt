@@ -41,7 +41,6 @@ pickleshare==0.7.5
 pillow>=11.0.0
 pip==24.0
 pip-cleanup==0.1.85
-pipreqs==0.5.0
 pillow
 platformdirs==4.2.0
 prompt-toolkit==3.0.43
