@@ -3,8 +3,8 @@ from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 import datetime
 from django.contrib.auth import authenticate, login, logout
-from .models import Post, Image, Attachment, Comment, Customization, Tag, Article, ArticleComment, Smile, SpecialPost, Message
-from django.db.models import Q, Max
+from .models import Post, Image, Attachment, Comment, Customization, Tag, Article, ArticleComment, Smile, SpecialPost, Message, LoginAttempt, AdminAction, PostViewDaily
+from django.db.models import Q, Max, F, Sum, Count
 from django.contrib.auth.models import User
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 from .serializer import PostSerializer, ImageSerializer, PostSupplementsSerializer, FullPostSerializer, \
@@ -12,12 +12,179 @@ from .serializer import PostSerializer, ImageSerializer, PostSupplementsSerializ
     FullUserSerializer, UserRegistrationSerializer, UserProfileRegistrationSerializer,\
     FullCustomizationSerializer, ContentCustomizationSerializer, \
     UserListSerializer, TagSerializer, CreateArticleSerializer, FullArticleSerializer, ArticleCommentCreateSerializer, ArticleCommentSerializer, \
-    SmileSerializer, SpecialPostSerializer, TitleArticleSerializer, MessageCreateSerializer, MessageSerializer
-import requests
-from bs4 import BeautifulSoup
+    SmileSerializer, SpecialPostSerializer, TitleArticleSerializer, MessageCreateSerializer, \
+    MessageSerializer, LoginAttemptSerializer, AdminActionSerializer, PostViewDailySerializer
 from django.utils import timezone
 from datetime import timedelta
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
+from django.db.models import Sum, Count
+from django.contrib.sessions.models import Session
+from django.core.cache import cache
+import random
+import string
+
+RANGE_DAYS = {'7d': 7, '30d': 30, '90d': 90}
+REGISTRATION_LIMIT = 10  
+REGISTRATION_WINDOW = 3600 
+CAPTCHA_TTL = 300  
+CAPTCHA_LENGTH = 5
+
+def check_login_rate(ip, username, limit=10, window=300):
+    """Не больше limit попыток за window секунд с IP и по username."""
+    keys = [f'login:ip:{ip}', f'login:user:{(username or "").lower()}']
+    for key in keys:
+        count = cache.get(key, 0)
+        if count >= limit:
+            return False
+    return True
+
+
+def bump_login_rate(ip, username, window=300):
+    for key in (f'login:ip:{ip}', f'login:user:{(username or "").lower()}'):
+        try:
+            cache.incr(key)
+        except ValueError:
+            cache.set(key, 1, timeout=window)
+
+def get_client_ip(request):
+    xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR')
+
+
+def log_admin_action(request, action, target=None):
+    AdminAction.objects.create(
+        user=request.user if request.user.is_authenticated else None,
+        action=action,
+        target_id=getattr(target, 'pk', None),
+        target_repr=str(target)[:200] if target is not None else '',
+        ip=get_client_ip(request),
+    )
+
+class LogoutAllView(viewsets.ViewSet):
+    def get_permissions(self):
+        return [IsAuthenticated()]
+
+    def create(self, request):
+        for s in Session.objects.all():
+            data = s.get_decoded()
+            if data.get('_auth_user_id') == str(request.user.pk):
+                s.delete()
+        return Response({'result': True})
+
+
+class HealthView(viewsets.ViewSet):
+    def get_permissions(self):
+        return [IsAdminUser()]
+
+    def list(self, request):
+        from django.db import connection
+        db_ok = True
+        try:
+            with connection.cursor() as c:
+                c.execute('SELECT 1')
+        except Exception:
+            db_ok = False
+        return Response({'db': db_ok})
+
+class StatsView(viewsets.ViewSet):
+    def get_permissions(self):
+        return [IsAdminUser()]
+
+    def list(self, request):
+        range_key = request.query_params.get('range', '7d')
+        days = RANGE_DAYS.get(range_key, 7)
+        now = timezone.now()
+        since = now - timedelta(days=days)
+
+        # --- overview ---
+        overview = {
+            'posts_total': Post.objects.count(),
+            'posts_in_range': Post.objects.filter(created_at__gte=since).count(),
+            'comments_total': Comment.objects.count(),
+            'comments_in_range': Comment.objects.filter(created_at__gte=since).count(),
+            'users_total': User.objects.count(),
+            'users_in_range': User.objects.filter(date_joined__gte=since).count(),
+        }
+
+        # --- traffic ---
+        traffic_qs = (
+            PostViewDaily.objects
+            .filter(date__gte=since.date())
+            .values('date')
+            .annotate(views=Sum('views'), clever_views=Sum('clever_views'))
+            .order_by('date')
+        )
+        traffic = [
+            {
+                'date': row['date'].isoformat(),
+                'views': row['views'] or 0,
+                'clever_views': row['clever_views'] or 0,
+            }
+            for row in traffic_qs
+        ]
+
+        # --- top posts ---
+        top_posts = list(
+            Post.objects.filter(is_new_post=False)
+            .order_by('-click')[:10]
+            .values('id', 'text', 'click', 'clever_click', 'created_at')
+        )
+        for p in top_posts:
+            p['created_at'] = p['created_at'].isoformat() if p['created_at'] else None
+
+        # --- security ---
+        failed_24h = LoginAttempt.objects.filter(
+            success=False, created_at__gte=now - timedelta(hours=24)
+        ).count()
+        failed_7d = LoginAttempt.objects.filter(
+            success=False, created_at__gte=now - timedelta(days=7)
+        ).count()
+
+        recent_logins = list(
+            LoginAttempt.objects.order_by('-created_at')[:20]
+            .values('id', 'username', 'ip', 'success', 'created_at')
+        )
+        for l in recent_logins:
+            l['created_at'] = l['created_at'].isoformat()
+
+        top_failed_ips = list(
+            LoginAttempt.objects
+            .filter(success=False, created_at__gte=since, ip__isnull=False)
+            .values('ip')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:10]
+        )
+
+        admin_actions_raw = list(
+            AdminAction.objects.select_related('user').order_by('-created_at')[:20]
+            .values('id', 'user__username', 'action', 'target_id', 'target_repr', 'created_at')
+        )
+        admin_actions = [
+            {
+                'id': a['id'],
+                'username': a['user__username'],
+                'action': a['action'],
+                'target_id': a['target_id'],
+                'target_repr': a['target_repr'],
+                'created_at': a['created_at'].isoformat(),
+            }
+            for a in admin_actions_raw
+        ]
+
+        return Response({
+            'overview': overview,
+            'traffic': traffic,
+            'top_posts': top_posts,
+            'security': {
+                'failed_logins_24h': failed_24h,
+                'failed_logins_7d': failed_7d,
+                'recent_logins': recent_logins,
+                'top_failed_ips': top_failed_ips,
+                'admin_actions': admin_actions,
+            },
+        })
 
 class PostView(viewsets.ViewSet):
     def get_permissions(self):
@@ -76,11 +243,11 @@ class PostView(viewsets.ViewSet):
     def delete(self, request):
         id = request.data.get('post_id')
         post = get_object_or_404(Post.objects, id=id)
-        images = Image.objects.all().filter(post=post)
         if not request.user.is_superuser:
             return Response(status=403, data={'error': 'Нет прав'})
-        for image in images:
+        for image in Image.objects.filter(post=post):
             image.file.delete(save=True)
+        log_admin_action(request, 'delete_post', post)
         post.delete()
         return Response(True)
 
@@ -90,6 +257,9 @@ class PostView(viewsets.ViewSet):
         post = get_object_or_404(Post.objects, id=id)
         post.click = click_counter
         post.save()
+        today = timezone.localdate()
+        obj, _ = PostViewDaily.objects.get_or_create(post=post, date=today)
+        PostViewDaily.objects.filter(pk=obj.pk).update(views=F('views') + 1)
         return Response(True)
 
     def send_clever_click(self, request):
@@ -98,6 +268,9 @@ class PostView(viewsets.ViewSet):
         post = get_object_or_404(Post.objects, id=id)
         post.clever_click = click_counter
         post.save()
+        today = timezone.localdate()
+        obj, _ = PostViewDaily.objects.get_or_create(post=post, date=today)
+        PostViewDaily.objects.filter(pk=obj.pk).update(clever_views=F('clever_views') + 1)
         return Response(True)
        
 class SpecialPostView(viewsets.ViewSet):
@@ -147,7 +320,6 @@ class MessageView(viewsets.ViewSet):
     
     def create(self, request):
         data = request.data
-        data['author'] = request.user.pk
         serializer = MessageCreateSerializer(data=data)
         if not serializer.is_valid():
             return Response(status=400, data=serializer.errors)
@@ -242,6 +414,7 @@ class CommentView(viewsets.ViewSet):
     def delete(self, request):
         id = request.data.get('comment_id')
         item = get_object_or_404(Comment.objects, id=id)
+        log_admin_action(request, 'delete_comment', item)
         item.delete()
         return Response(True)
 
@@ -286,6 +459,23 @@ class AttachmentView(viewsets.ViewSet):
         attachment.delete()
         return Response(True)
 
+class CaptchaView(viewsets.ViewSet):
+    def get_permissions(self):
+        return [AllowAny()]
+
+    def create(self, request):
+        # генерируем текст без похожих символов (0/O, 1/l/I)
+        alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+        text = ''.join(random.choice(alphabet) for _ in range(CAPTCHA_LENGTH))
+        captcha_id = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(32))
+
+        cache.set(f'captcha:{captcha_id}', text.lower(), timeout=CAPTCHA_TTL)
+
+        return Response({
+            'captcha_id': captcha_id,
+            'text': text,  # клиент рисует сам; в проде можно отдавать SVG
+        })
+
 class UserView(viewsets.ViewSet):
     def get_permissions(self):
         if self.action in ('count', 'user_list', 'search_list', 'login_or_registration'):
@@ -326,19 +516,61 @@ class UserView(viewsets.ViewSet):
         username = data.get('username')
         password = data.get('password')
         operation = data.get('operation')
+        ip = get_client_ip(request)
+
+        if not check_login_rate(ip, username):
+            return Response(status=429, data={"error": "Слишком много попыток. Попробуйте позже."})
+
         if operation == 'registration':
+            captcha_id = data.get('captcha_id')
+            captcha_input = (data.get('captcha_input') or '').strip().lower()
+
+            if not captcha_id or not captcha_input:
+                return Response(status=400, data={'error': 'Введите капчу.'})
+
+            expected = cache.get(f'captcha:{captcha_id}')
+            if expected is None:
+                return Response(status=400, data={'error': 'Капча устарела. Обновите страницу.'})
+            if expected != captcha_input:
+                return Response(status=400, data={'error': 'Капча введена неверно.'})
+
+            cache.delete(f'captcha:{captcha_id}')
+            reg_key = f'reg:ip:{ip}'
+            if cache.get(reg_key, 0) >= REGISTRATION_LIMIT:
+                return Response(status=429, data={"error": "Слишком много регистраций. Попробуйте позже."})
+
             serializer = UserRegistrationSerializer(data=data)
             if not serializer.is_valid():
                 return Response(status=400, data=serializer.errors)
+
             user = serializer.save()
             user.is_active = True
             user.save()
+
+            try:
+                cache.incr(reg_key)
+            except ValueError:
+                cache.set(reg_key, 1, timeout=REGISTRATION_WINDOW)
+
         user = authenticate(username=username, password=password)
+
         if user is not None:
+            LoginAttempt.objects.create(
+                username=username or '', ip=ip,
+                user_agent=request.META.get('HTTP_USER_AGENT', '')[:300],
+                success=True,
+            )
             login(request, user)
-        else:
-            return Response(status=404, data={"error": "Эти данные не позволяют авторизироваться."})
-        return Response(True)
+            request.session.cycle_key()
+            return Response(True)
+
+        bump_login_rate(ip, username)
+        LoginAttempt.objects.create(
+            username=username or '', ip=ip,
+            user_agent=request.META.get('HTTP_USER_AGENT', '')[:300],
+            success=False,
+        )
+        return Response(status=404, data={"error": "Эти данные не позволяют авторизироваться."})
 
     def profile_create(self, request):
         data = request.data
@@ -365,7 +597,7 @@ class UserView(viewsets.ViewSet):
         user.save()
         return Response(True)
 
-    def logout(self, request):
+    def user_logout(self, request):
         logout(request)
         return Response(True)
 
@@ -373,6 +605,7 @@ class UserView(viewsets.ViewSet):
         id = request.data.get('user_id')
         queryset = User.objects.all()
         user = get_object_or_404(queryset, id=id)
+        log_admin_action(request, 'block_user', user)
         if user.is_active:
             user.is_active = False
         else:
@@ -386,6 +619,7 @@ class UserView(viewsets.ViewSet):
             user = get_object_or_404(queryset, id=id)
             if user.is_superuser or user.pk == request.user.pk:
                 return Response(status=403, data={'error': 'Нельзя удалить этого пользователя'})
+            log_admin_action(request, 'delete_user', user)
             user.delete()
             return Response({'result': True})
 
@@ -666,6 +900,7 @@ class ArticleView(viewsets.ViewSet):
         item = get_object_or_404(Article.objects, id=id)
         if not request.user.is_superuser:
             return Response(status=403, data={'error': 'Нет прав'})
+        log_admin_action(request, 'delete_article', item)   # <-- здесь
         item.cover.delete(save=True)
         item.delete()
         return Response(True)
@@ -704,6 +939,7 @@ class ArticleCommentView(viewsets.ViewSet):
         item = get_object_or_404(ArticleComment.objects, id=id)
         if not request.user.is_superuser:
             return Response(status=403, data={'error': 'Нет прав'})
+        log_admin_action(request, 'delete_article_comment', item)
         item.delete()
         return Response(True)
         

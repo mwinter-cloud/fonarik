@@ -1,6 +1,6 @@
 from django.urls import path
 
-from .views import PostView, ImageView, AttachmentView, CommentView, UserView, CustomizationView, TagView, ArticleView, ArticleCommentView, SmileView, SpecialPostView, MessageView
+from .views import PostView, ImageView, AttachmentView, CommentView, UserView, CustomizationView, TagView, ArticleView, ArticleCommentView, SmileView, SpecialPostView, MessageView, StatsView, CaptchaView
 
 urlpatterns = [
     #post
@@ -30,6 +30,7 @@ urlpatterns = [
     path('add-comment', CommentView.as_view({'post': 'create'})),
     path('comments-count/<int:post_id>', CommentView.as_view({'get': 'count'})),
     path('delete-comment', CommentView.as_view({'post': 'delete'})),
+    path('captcha', CaptchaView.as_view({'post': 'create'})),
     #user
     path('users-count', UserView.as_view({'get': 'count'})),
     path('login-or-registration', UserView.as_view({'post': 'login_or_registration'})),
@@ -43,7 +44,7 @@ urlpatterns = [
     #path('is-admin', UserView.as_view({'get': 'is_admin'})),
     path('change-name', UserView.as_view({'post': 'change_name'})),
     path('change-email', UserView.as_view({'post': 'change_email'})),
-    path('logout', UserView.as_view({'post': 'logout'})),
+    path('logout', UserView.as_view({'post': 'user_logout'})),
     #customization
     path('profile-info', CustomizationView.as_view({'get': 'profile_info'})),
     path('profile-about', CustomizationView.as_view({'get': 'profile_about'})),
@@ -85,4 +86,6 @@ urlpatterns = [
     path('is-new-message', MessageView.as_view({'get': 'is_new_message'})),
     path('is-message', MessageView.as_view({'get': 'is_message'})),
     path('new-message', MessageView.as_view({'get': 'new_message'})),
+    #статистика
+    path('stats', StatsView.as_view({'get': 'list'})),
 ]

@@ -5,7 +5,7 @@ from django.core.files.base import ContentFile
 from PIL import Image
 
 class Post(models.Model):
-    text = models.CharField(max_length=1500, blank=True)
+    text = models.CharField(max_length=10000, blank=True)
     created_at = models.DateTimeField(null=True)
     is_new_post = models.BooleanField(default=False)
     click = models.IntegerField(default=0)
@@ -169,3 +169,55 @@ class ArticleComment(models.Model):
 class Smile(models.Model):
     file = models.ImageField(upload_to='smiles/')
 
+class LoginAttempt(models.Model):
+    username = models.CharField(max_length=150, blank=True)
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=300, blank=True)
+    success = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['success', 'created_at']),
+            models.Index(fields=['ip', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.username} {'ok' if self.success else 'fail'} {self.created_at}"
+
+class AdminAction(models.Model):
+    ACTIONS = [
+        ('delete_post', 'delete_post'),
+        ('delete_comment', 'delete_comment'),
+        ('delete_article', 'delete_article'),
+        ('delete_article_comment', 'delete_article_comment'),
+        ('delete_user', 'delete_user'),
+        ('block_user', 'block_user'),
+        ('edit_customization', 'edit_customization'),
+    ]
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    action = models.CharField(max_length=32, choices=ACTIONS)
+    target_id = models.IntegerField(null=True, blank=True)
+    target_repr = models.CharField(max_length=200, blank=True)
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.action} {self.target_repr}"
+
+class PostViewDaily(models.Model):
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='daily_views')
+    date = models.DateField(db_index=True)
+    views = models.PositiveIntegerField(default=0)
+    clever_views = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        unique_together = [('post', 'date')]
+        ordering = ['-date']
+
+    def __str__(self):
+        return f"{self.post_id} {self.date} {self.views}"
